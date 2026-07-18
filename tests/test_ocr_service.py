@@ -1,0 +1,644 @@
+"""Tests for ocr_service. No running Ollama server or real model required."""
+
+import os
+import queue
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
+
+import config
+import ocr_service
+from ocr_service import OCRRequest, OCRServiceError
+
+
+def chat_response(content):
+    """Shape of ollama.Client.chat() responses: response.message.content."""
+    return SimpleNamespace(message=SimpleNamespace(content=content))
+
+
+def model_entry(tag):
+    """Shape of ollama.Client.list() entries: item.model."""
+    return SimpleNamespace(model=tag)
+
+
+def make_fake_document(page_count, needs_pass=False):
+    """A PyMuPDF document mock usable as a context manager."""
+    document = mock.MagicMock()
+    document.needs_pass = needs_pass
+    document.page_count = page_count
+    document.__enter__.return_value = document
+    document.__exit__.return_value = False
+    pages = []
+    for _ in range(page_count):
+        page = mock.MagicMock()
+        page.get_pixmap.return_value = mock.MagicMock()
+        pages.append(page)
+    document.load_page.side_effect = lambda index: pages[index]
+    document.fake_pages = pages
+    return document
+
+
+def drain(event_queue):
+    events = []
+    while True:
+        try:
+            events.append(event_queue.get_nowait())
+        except queue.Empty:
+            return events
+
+
+class TestNormalizeOllamaUrl(unittest.TestCase):
+    def test_default_url_unchanged(self):
+        self.assertEqual(
+            ocr_service.normalize_ollama_url("http://localhost:11434"),
+            "http://localhost:11434",
+        )
+
+    def test_whitespace_and_trailing_slash_trimmed(self):
+        self.assertEqual(
+            ocr_service.normalize_ollama_url("  http://192.168.1.20:11434/  "),
+            "http://192.168.1.20:11434",
+        )
+
+    def test_multiple_trailing_slashes_trimmed(self):
+        self.assertEqual(
+            ocr_service.normalize_ollama_url("http://ollama.local:11434//"),
+            "http://ollama.local:11434",
+        )
+
+    def test_https_accepted(self):
+        self.assertEqual(
+            ocr_service.normalize_ollama_url("https://ollama.example.com"),
+            "https://ollama.example.com",
+        )
+
+    def test_reverse_proxy_path_prefix_preserved(self):
+        self.assertEqual(
+            ocr_service.normalize_ollama_url("https://server.lan/ollama/"),
+            "https://server.lan/ollama",
+        )
+
+    def test_empty_rejected(self):
+        for value in ("", "   ", "///"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    ocr_service.normalize_ollama_url(value)
+
+    def test_missing_host_rejected(self):
+        for value in ("http://", "http:///path"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    ocr_service.normalize_ollama_url(value)
+
+    def test_non_http_scheme_rejected(self):
+        for value in ("ftp://host:11434", "file:///tmp/x", "localhost:11434"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    ocr_service.normalize_ollama_url(value)
+
+
+class TestValidateInputPath(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+
+    def make_file(self, name):
+        path = self.dir / name
+        path.write_bytes(b"data")
+        return path
+
+    def test_missing_file_rejected(self):
+        with self.assertRaisesRegex(ValueError, "exist"):
+            ocr_service.validate_input_path(self.dir / "missing.pdf")
+
+    def test_directory_rejected(self):
+        subdir = self.dir / "folder.pdf"
+        subdir.mkdir()
+        with self.assertRaises(ValueError):
+            ocr_service.validate_input_path(subdir)
+
+    def test_unsupported_extension_rejected(self):
+        path = self.make_file("notes.txt")
+        with self.assertRaisesRegex(ValueError, "Unsupported"):
+            ocr_service.validate_input_path(path)
+
+    def test_supported_extensions_accepted(self):
+        for name in ("a.pdf", "b.png", "c.jpg", "d.jpeg", "e.webp"):
+            with self.subTest(name=name):
+                ocr_service.validate_input_path(self.make_file(name))
+
+    def test_uppercase_extensions_accepted(self):
+        for name in ("UPPER.PDF", "SHOUT.PNG", "MIXED.JpEg"):
+            with self.subTest(name=name):
+                ocr_service.validate_input_path(self.make_file(name))
+
+    @unittest.skipIf(
+        os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+        "chmod-based unreadability is not enforced for root or on Windows",
+    )
+    def test_unreadable_file_rejected(self):
+        path = self.make_file("locked.pdf")
+        path.chmod(0)
+        self.addCleanup(path.chmod, 0o600)
+        with self.assertRaisesRegex(ValueError, "readable"):
+            ocr_service.validate_input_path(path)
+
+
+class TestBuildOutputPath(unittest.TestCase):
+    def test_pdf(self):
+        self.assertEqual(
+            ocr_service.build_output_path(Path("/docs/report.pdf")),
+            Path("/docs/report_extracted.md"),
+        )
+
+    def test_image(self):
+        self.assertEqual(
+            ocr_service.build_output_path(Path("/pics/scan.png")),
+            Path("/pics/scan_extracted.md"),
+        )
+
+    def test_dotted_stem(self):
+        self.assertEqual(
+            ocr_service.build_output_path(Path("/docs/report.v2.pdf")),
+            Path("/docs/report.v2_extracted.md"),
+        )
+
+
+class TestListModels(unittest.TestCase):
+    URL = "http://server:11434"
+
+    def test_extraction_dedup_and_case_insensitive_sort(self):
+        response = SimpleNamespace(
+            models=[
+                model_entry("zeta:7b"),
+                model_entry("Alpha:12b"),
+                model_entry("  "),
+                model_entry("zeta:7b"),
+                model_entry(None),
+                model_entry("beta:2b "),
+            ]
+        )
+        with mock.patch.object(ocr_service.ollama, "Client") as client_cls:
+            client_cls.return_value.list.return_value = response
+            result = ocr_service.list_models(self.URL)
+        self.assertEqual(result, ["Alpha:12b", "beta:2b", "zeta:7b"])
+        client_cls.assert_called_once_with(
+            host=self.URL, timeout=config.MODEL_LIST_TIMEOUT
+        )
+
+    def test_empty_server_list(self):
+        with mock.patch.object(ocr_service.ollama, "Client") as client_cls:
+            client_cls.return_value.list.return_value = SimpleNamespace(models=[])
+            self.assertEqual(ocr_service.list_models(self.URL), [])
+
+    def test_client_construction_error_propagates_with_context(self):
+        with mock.patch.object(ocr_service.ollama, "Client") as client_cls:
+            client_cls.side_effect = ConnectionError("connection refused")
+            with self.assertRaises(OCRServiceError) as ctx:
+                ocr_service.list_models(self.URL)
+        self.assertIn(self.URL, str(ctx.exception))
+        self.assertIn("connection refused", str(ctx.exception))
+
+    def test_list_call_error_propagates_with_context(self):
+        with mock.patch.object(ocr_service.ollama, "Client") as client_cls:
+            client_cls.return_value.list.side_effect = TimeoutError("timed out")
+            with self.assertRaises(OCRServiceError) as ctx:
+                ocr_service.list_models(self.URL)
+        self.assertIn("timed out", str(ctx.exception))
+
+    def test_unexpected_response_shape_wrapped_with_context(self):
+        # e.g. a proxy or an incompatible client version returning a plain
+        # dict instead of an object with a .models attribute.
+        with mock.patch.object(ocr_service.ollama, "Client") as client_cls:
+            client_cls.return_value.list.return_value = {"models": []}
+            with self.assertRaises(OCRServiceError) as ctx:
+                ocr_service.list_models(self.URL)
+        self.assertIn(self.URL, str(ctx.exception))
+
+
+class TestSaveMarkdownAtomic(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        self.output = self.dir / "doc_extracted.md"
+
+    def test_writes_utf8(self):
+        content = "# Überschrift\n\nТекст — naïve café ✓"
+        ocr_service.save_markdown_atomic(self.output, content)
+        self.assertEqual(self.output.read_text(encoding="utf-8"), content)
+
+    def test_normalizes_newlines(self):
+        ocr_service.save_markdown_atomic(self.output, "a\r\nb\rc\n")
+        self.assertEqual(self.output.read_bytes(), b"a\nb\nc\n")
+
+    def test_replaces_existing_file(self):
+        self.output.write_text("old", encoding="utf-8")
+        ocr_service.save_markdown_atomic(self.output, "new")
+        self.assertEqual(self.output.read_text(encoding="utf-8"), "new")
+
+    def test_no_leftover_temp_file_on_success(self):
+        ocr_service.save_markdown_atomic(self.output, "content")
+        self.assertEqual(list(self.dir.iterdir()), [self.output])
+
+    def test_replace_failure_removes_temp_and_keeps_existing(self):
+        self.output.write_text("old", encoding="utf-8")
+        with mock.patch.object(ocr_service.os, "replace") as replace:
+            replace.side_effect = OSError("disk full")
+            with self.assertRaises(OCRServiceError) as ctx:
+                ocr_service.save_markdown_atomic(self.output, "new")
+        self.assertIn("disk full", str(ctx.exception))
+        self.assertEqual(self.output.read_text(encoding="utf-8"), "old")
+        self.assertEqual(list(self.dir.iterdir()), [self.output])
+
+    def test_temp_creation_failure_reports_error(self):
+        with mock.patch.object(
+            ocr_service.tempfile, "NamedTemporaryFile"
+        ) as ntf:
+            ntf.side_effect = OSError("permission denied")
+            with self.assertRaises(OCRServiceError):
+                ocr_service.save_markdown_atomic(self.output, "content")
+        self.assertEqual(list(self.dir.iterdir()), [])
+
+
+class TestRecognizeImages(unittest.TestCase):
+    MODEL = "vision-model:latest"
+
+    def test_one_independent_request_per_image_with_exact_prompt(self):
+        client = mock.MagicMock()
+        client.chat.side_effect = [chat_response(" one "), chat_response("two\n")]
+        paths = [Path("/imgs/page_0001.png"), Path("/imgs/page_0002.png")]
+        results = ocr_service.recognize_images(
+            client, self.MODEL, paths, lambda _msg: None
+        )
+        self.assertEqual(results, ["one", "two"])
+        self.assertEqual(client.chat.call_count, 2)
+        for call, path in zip(client.chat.call_args_list, paths):
+            self.assertEqual(call.kwargs["model"], self.MODEL)
+            self.assertEqual(
+                call.kwargs["messages"],
+                [
+                    {"role": "system", "content": config.SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": "Recognize this document page.",
+                        "images": [str(path)],
+                    },
+                ],
+            )
+        first, second = (c.kwargs["messages"] for c in client.chat.call_args_list)
+        self.assertIsNot(first, second)
+
+    def test_progress_messages_in_order(self):
+        client = mock.MagicMock()
+        client.chat.side_effect = [chat_response(f"p{i}") for i in range(3)]
+        logs = []
+        ocr_service.recognize_images(
+            client, self.MODEL, [Path(f"/i/{i}.png") for i in range(3)], logs.append
+        )
+        self.assertEqual(
+            logs,
+            [
+                "Sending page 1/3 to Ollama...",
+                "Sending page 2/3 to Ollama...",
+                "Sending page 3/3 to Ollama...",
+            ],
+        )
+
+    def test_empty_content_fails_identifying_page(self):
+        for empty in (None, "", "   \n\t"):
+            with self.subTest(content=repr(empty)):
+                client = mock.MagicMock()
+                client.chat.side_effect = [chat_response("fine"), chat_response(empty)]
+                with self.assertRaises(OCRServiceError) as ctx:
+                    ocr_service.recognize_images(
+                        client,
+                        self.MODEL,
+                        [Path("/i/1.png"), Path("/i/2.png")],
+                        lambda _msg: None,
+                    )
+                self.assertIn("page 2/2", str(ctx.exception))
+
+    def test_chat_failure_wrapped_with_page_and_model_context(self):
+        client = mock.MagicMock()
+        client.chat.side_effect = [chat_response("ok"), RuntimeError("model not found")]
+        with self.assertRaises(OCRServiceError) as ctx:
+            ocr_service.recognize_images(
+                client,
+                self.MODEL,
+                [Path("/i/1.png"), Path("/i/2.png")],
+                lambda _msg: None,
+            )
+        message = str(ctx.exception)
+        self.assertIn("page 2/2", message)
+        self.assertIn(self.MODEL, message)
+        self.assertIn("model not found", message)
+
+
+class TestRenderPdf(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.temp_dir = Path(self.tmp.name)
+        self.pdf_path = Path("/docs/input.pdf")
+
+    def test_ordered_render_with_dpi_rgb_no_alpha(self):
+        document = make_fake_document(3)
+        logs = []
+        with mock.patch.object(ocr_service, "pymupdf") as fake_pymupdf:
+            fake_pymupdf.open.return_value = document
+            paths = ocr_service.render_pdf(
+                self.pdf_path, 200, self.temp_dir, logs.append
+            )
+        fake_pymupdf.open.assert_called_once_with(self.pdf_path)
+        self.assertEqual(
+            document.load_page.call_args_list,
+            [mock.call(0), mock.call(1), mock.call(2)],
+        )
+        for page in document.fake_pages:
+            page.get_pixmap.assert_called_once_with(
+                dpi=200, colorspace=fake_pymupdf.csRGB, alpha=False
+            )
+        self.assertEqual(
+            [p.name for p in paths],
+            ["page_0001.png", "page_0002.png", "page_0003.png"],
+        )
+        self.assertTrue(all(p.parent == self.temp_dir for p in paths))
+        for page, path in zip(document.fake_pages, paths):
+            page.get_pixmap.return_value.save.assert_called_once_with(str(path))
+        self.assertEqual(
+            logs,
+            [
+                "Rendering page 1/3...",
+                "Rendering page 2/3...",
+                "Rendering page 3/3...",
+            ],
+        )
+        self.assertTrue(document.__exit__.called)
+
+    def test_zero_padding_keeps_numeric_order_past_page_nine(self):
+        document = make_fake_document(12)
+        with mock.patch.object(ocr_service, "pymupdf") as fake_pymupdf:
+            fake_pymupdf.open.return_value = document
+            paths = ocr_service.render_pdf(
+                self.pdf_path, 150, self.temp_dir, lambda _msg: None
+            )
+        names = [p.name for p in paths]
+        self.assertEqual(names[9], "page_0010.png")
+        self.assertEqual(names, sorted(names))
+
+    def test_password_protected_fails_before_rendering(self):
+        document = make_fake_document(5, needs_pass=True)
+        with mock.patch.object(ocr_service, "pymupdf") as fake_pymupdf:
+            fake_pymupdf.open.return_value = document
+            with self.assertRaisesRegex(OCRServiceError, "password"):
+                ocr_service.render_pdf(
+                    self.pdf_path, 150, self.temp_dir, lambda _msg: None
+                )
+        document.load_page.assert_not_called()
+        self.assertTrue(document.__exit__.called)
+
+    def test_zero_page_pdf_fails(self):
+        document = make_fake_document(0)
+        with mock.patch.object(ocr_service, "pymupdf") as fake_pymupdf:
+            fake_pymupdf.open.return_value = document
+            with self.assertRaisesRegex(OCRServiceError, "no pages"):
+                ocr_service.render_pdf(
+                    self.pdf_path, 150, self.temp_dir, lambda _msg: None
+                )
+        document.load_page.assert_not_called()
+        self.assertTrue(document.__exit__.called)
+
+    def test_open_failure_wrapped(self):
+        with mock.patch.object(ocr_service, "pymupdf") as fake_pymupdf:
+            fake_pymupdf.open.side_effect = RuntimeError("broken xref")
+            with self.assertRaises(OCRServiceError) as ctx:
+                ocr_service.render_pdf(
+                    self.pdf_path, 150, self.temp_dir, lambda _msg: None
+                )
+        self.assertIn("broken xref", str(ctx.exception))
+
+    def test_page_render_failure_identifies_page_and_closes_document(self):
+        document = make_fake_document(3)
+        document.fake_pages[1].get_pixmap.return_value.save.side_effect = OSError(
+            "write failed"
+        )
+        with mock.patch.object(ocr_service, "pymupdf") as fake_pymupdf:
+            fake_pymupdf.open.return_value = document
+            with self.assertRaises(OCRServiceError) as ctx:
+                ocr_service.render_pdf(
+                    self.pdf_path, 150, self.temp_dir, lambda _msg: None
+                )
+        self.assertIn("page 2/3", str(ctx.exception))
+        self.assertTrue(document.__exit__.called)
+
+
+class TestProcessOcr(unittest.TestCase):
+    URL = "http://server:11434"
+    MODEL = "vision:7b"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+
+    def make_request(self, name, dpi=150):
+        input_path = self.dir / name
+        input_path.write_bytes(b"fake bytes")
+        return OCRRequest(
+            input_path=input_path,
+            output_path=ocr_service.build_output_path(input_path),
+            ollama_url=self.URL,
+            model=self.MODEL,
+            dpi=dpi,
+        )
+
+    def run_pdf_pipeline(self, request, document, chat_side_effect,
+                         replace_error=None):
+        """Run process_ocr for a PDF with mocks; return (result, error, events,
+        created_temp_dirs)."""
+        events = queue.Queue()
+        created = []
+        real_mkdtemp = tempfile.mkdtemp
+
+        def spy_mkdtemp(*args, **kwargs):
+            path = real_mkdtemp(*args, **kwargs)
+            created.append(path)
+            return path
+
+        patches = [
+            mock.patch.object(ocr_service, "pymupdf"),
+            mock.patch.object(ocr_service.ollama, "Client"),
+            mock.patch.object(ocr_service.tempfile, "mkdtemp", side_effect=spy_mkdtemp),
+        ]
+        result = error = None
+        with patches[0] as fake_pymupdf, patches[1] as client_cls, patches[2]:
+            fake_pymupdf.open.return_value = document
+            client_cls.return_value.chat.side_effect = chat_side_effect
+            self.client_cls = client_cls
+            try:
+                if replace_error is not None:
+                    with mock.patch.object(
+                        ocr_service.os, "replace", side_effect=replace_error
+                    ):
+                        result = ocr_service.process_ocr(request, events)
+                else:
+                    result = ocr_service.process_ocr(request, events)
+            except Exception as exc:
+                error = exc
+        return result, error, drain(events), created
+
+    def test_image_input_passed_directly_no_render_dir(self):
+        request = self.make_request("photo.png")
+        events = queue.Queue()
+        with mock.patch.object(ocr_service.ollama, "Client") as client_cls, \
+                mock.patch.object(ocr_service.tempfile, "mkdtemp") as mkdtemp:
+            client_cls.return_value.chat.return_value = chat_response("recognized")
+            result = ocr_service.process_ocr(request, events)
+        mkdtemp.assert_not_called()
+        self.assertEqual(result, request.output_path)
+        self.assertEqual(
+            request.output_path.read_text(encoding="utf-8"), "recognized"
+        )
+        client_cls.assert_called_once_with(host=self.URL, timeout=config.OCR_TIMEOUT)
+        images = client_cls.return_value.chat.call_args.kwargs["messages"][1]["images"]
+        self.assertEqual(images, [str(request.input_path)])
+        logs = [payload for kind, payload in drain(events) if kind == "log"]
+        self.assertEqual(logs[0], "[1/3] Preparing image...")
+        self.assertIn("[2/3] Sending page 1/1 to Ollama...", logs)
+        self.assertIn("[3/3] Saving Markdown...", logs)
+
+    def test_pdf_pipeline_order_join_and_cleanup(self):
+        request = self.make_request("doc.pdf", dpi=300)
+        document = make_fake_document(3)
+        result, error, events, created = self.run_pdf_pipeline(
+            request,
+            document,
+            [chat_response("p1"), chat_response("p2"), chat_response("p3")],
+        )
+        self.assertIsNone(error)
+        self.assertEqual(result, request.output_path)
+        self.assertEqual(
+            request.output_path.read_text(encoding="utf-8"), "p1\n\np2\n\np3"
+        )
+        # Temp dir was created with the required prefix and removed afterwards.
+        self.assertEqual(len(created), 1)
+        self.assertTrue(Path(created[0]).name.startswith("local_ocr_"))
+        self.assertFalse(Path(created[0]).exists())
+        # Rendering finished before recognition started.
+        logs = [payload for kind, payload in events if kind == "log"]
+        self.assertEqual(logs[0], "[1/3] Preparing document...")
+        last_render = max(i for i, m in enumerate(logs) if m.startswith("[1/3]"))
+        first_send = min(i for i, m in enumerate(logs) if m.startswith("[2/3]"))
+        self.assertLess(last_render, first_send)
+        # Pages were sent in numeric order from the render directory.
+        calls = self.client_cls.return_value.chat.call_args_list
+        sent = [c.kwargs["messages"][1]["images"][0] for c in calls]
+        expected = [
+            str(Path(created[0]) / f"page_{n:04d}.png") for n in (1, 2, 3)
+        ]
+        self.assertEqual(sent, expected)
+
+    def test_render_failure_cleans_temp_dir_and_no_output(self):
+        request = self.make_request("doc.pdf")
+        document = make_fake_document(2)
+        document.fake_pages[0].get_pixmap.side_effect = RuntimeError("render boom")
+        result, error, _events, created = self.run_pdf_pipeline(
+            request, document, []
+        )
+        self.assertIsNone(result)
+        self.assertIsInstance(error, OCRServiceError)
+        self.assertFalse(Path(created[0]).exists())
+        self.assertFalse(request.output_path.exists())
+
+    def test_client_construction_failure_cleans_temp_dir(self):
+        request = self.make_request("doc.pdf")
+        document = make_fake_document(1)
+        events = queue.Queue()
+        created = []
+        real_mkdtemp = tempfile.mkdtemp
+
+        def spy_mkdtemp(*args, **kwargs):
+            path = real_mkdtemp(*args, **kwargs)
+            created.append(path)
+            return path
+
+        with mock.patch.object(ocr_service, "pymupdf") as fake_pymupdf, \
+                mock.patch.object(ocr_service.ollama, "Client") as client_cls, \
+                mock.patch.object(
+                    ocr_service.tempfile, "mkdtemp", side_effect=spy_mkdtemp
+                ):
+            fake_pymupdf.open.return_value = document
+            client_cls.side_effect = ConnectionError("no route to host")
+            with self.assertRaises(OCRServiceError) as ctx:
+                ocr_service.process_ocr(request, events)
+        self.assertIn("no route to host", str(ctx.exception))
+        self.assertFalse(Path(created[0]).exists())
+        self.assertFalse(request.output_path.exists())
+
+    def test_mkdtemp_failure_wrapped_and_no_output(self):
+        request = self.make_request("doc.pdf")
+        events = queue.Queue()
+        with mock.patch.object(
+            ocr_service.tempfile, "mkdtemp", side_effect=OSError("no space left")
+        ):
+            with self.assertRaises(OCRServiceError) as ctx:
+                ocr_service.process_ocr(request, events)
+        self.assertIn("no space left", str(ctx.exception))
+        self.assertFalse(request.output_path.exists())
+
+    def test_late_page_failure_leaves_no_new_output(self):
+        request = self.make_request("doc.pdf")
+        document = make_fake_document(2)
+        result, error, _events, created = self.run_pdf_pipeline(
+            request,
+            document,
+            [chat_response("p1"), RuntimeError("model exploded")],
+        )
+        self.assertIsNone(result)
+        self.assertIsInstance(error, OCRServiceError)
+        self.assertFalse(request.output_path.exists())
+        self.assertFalse(Path(created[0]).exists())
+
+    def test_late_page_failure_preserves_existing_output(self):
+        request = self.make_request("doc.pdf")
+        request.output_path.write_text("previous run", encoding="utf-8")
+        document = make_fake_document(2)
+        result, error, _events, created = self.run_pdf_pipeline(
+            request,
+            document,
+            [chat_response("p1"), RuntimeError("model exploded")],
+        )
+        self.assertIsNone(result)
+        self.assertIsNotNone(error)
+        self.assertEqual(
+            request.output_path.read_text(encoding="utf-8"), "previous run"
+        )
+        self.assertFalse(Path(created[0]).exists())
+
+    def test_save_failure_cleans_temp_dir_and_preserves_existing_output(self):
+        request = self.make_request("doc.pdf")
+        request.output_path.write_text("previous run", encoding="utf-8")
+        document = make_fake_document(1)
+        result, error, _events, created = self.run_pdf_pipeline(
+            request,
+            document,
+            [chat_response("p1")],
+            replace_error=OSError("disk full"),
+        )
+        self.assertIsNone(result)
+        self.assertIsInstance(error, OCRServiceError)
+        self.assertEqual(
+            request.output_path.read_text(encoding="utf-8"), "previous run"
+        )
+        self.assertFalse(Path(created[0]).exists())
+        # No stray temp output file remains next to the output either.
+        leftovers = [p for p in self.dir.iterdir() if p.suffix == ".tmp"]
+        self.assertEqual(leftovers, [])
+
+
+if __name__ == "__main__":
+    unittest.main()

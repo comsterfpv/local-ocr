@@ -1,0 +1,35 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Test and coverage output
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Temporary files
+*.tmp
+*.log
+
+# Editors and OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Other stuff
+CLAUDE.md
+AGENTS.md
+.claude/
+docs/
+build-mac.sh
+
+# Syncthing
+.syncthing.*
