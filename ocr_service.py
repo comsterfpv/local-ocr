@@ -20,6 +20,7 @@ import pymupdf
 import config
 
 LogCallback = Callable[[str], None]
+ProgressCallback = Callable[[str, int, int], None]  # phase, current, total
 
 
 class OCRServiceError(Exception):
@@ -93,7 +94,11 @@ def list_models(url: str) -> list[str]:
 
 
 def render_pdf(
-    pdf_path: Path, dpi: int, temp_dir: Path, log_callback: LogCallback
+    pdf_path: Path,
+    dpi: int,
+    temp_dir: Path,
+    log_callback: LogCallback,
+    progress_callback: ProgressCallback | None = None,
 ) -> list[Path]:
     """Render every PDF page to a PNG in temp_dir, in original page order."""
     try:
@@ -111,6 +116,8 @@ def render_pdf(
         image_paths: list[Path] = []
         for index in range(page_count):
             page_number = index + 1
+            if progress_callback is not None:
+                progress_callback("render", page_number, page_count)
             log_callback(f"Rendering page {page_number}/{page_count}...")
             try:
                 page = document.load_page(index)
@@ -132,11 +139,14 @@ def recognize_images(
     model: str,
     image_paths: list[Path],
     log_callback: LogCallback,
+    progress_callback: ProgressCallback | None = None,
 ) -> list[str]:
     """Send one independent chat request per image; return texts in order."""
     total = len(image_paths)
     results: list[str] = []
     for number, image_path in enumerate(image_paths, start=1):
+        if progress_callback is not None:
+            progress_callback("ocr", number, total)
         log_callback(f"Sending page {number}/{total} to Ollama...")
         try:
             response = client.chat(
@@ -205,6 +215,9 @@ def process_ocr(request: OCRRequest, event_queue) -> Path:
     def log(message: str) -> None:
         event_queue.put(("log", message))
 
+    def progress(phase: str, current: int, total: int) -> None:
+        event_queue.put(("progress", {"phase": phase, "current": current, "total": total}))
+
     temp_dir: Path | None = None
     try:
         if request.input_path.suffix.lower() in config.PDF_EXTENSIONS:
@@ -220,6 +233,7 @@ def process_ocr(request: OCRRequest, event_queue) -> Path:
                 request.dpi,
                 temp_dir,
                 lambda message: log(f"[1/3] {message}"),
+                progress,
             )
         else:
             log("[1/3] Preparing image...")
@@ -237,6 +251,7 @@ def process_ocr(request: OCRRequest, event_queue) -> Path:
             request.model,
             image_paths,
             lambda message: log(f"[2/3] {message}"),
+            progress,
         )
 
         log("[3/3] Saving Markdown...")

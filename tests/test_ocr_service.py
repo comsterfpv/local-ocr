@@ -308,6 +308,28 @@ class TestRecognizeImages(unittest.TestCase):
             ],
         )
 
+    def test_progress_callback_emits_ocr_before_each_page(self):
+        client = mock.MagicMock()
+        client.chat.side_effect = [chat_response(f"p{i}") for i in range(3)]
+        events = []
+        ocr_service.recognize_images(
+            client,
+            self.MODEL,
+            [Path(f"/i/{i}.png") for i in range(3)],
+            lambda _msg: None,
+            lambda phase, cur, tot: events.append((phase, cur, tot)),
+        )
+        self.assertEqual(
+            events,
+            [
+                ("ocr", 1, 3),
+                ("ocr", 2, 3),
+                ("ocr", 3, 3),
+            ],
+        )
+        # Each progress event fires before the corresponding chat call.
+        self.assertEqual(client.chat.call_count, 3)
+
     def test_empty_content_fails_identifying_page(self):
         for empty in (None, "", "   \n\t"):
             with self.subTest(content=repr(empty)):
@@ -435,6 +457,26 @@ class TestRenderPdf(unittest.TestCase):
         self.assertIn("page 2/3", str(ctx.exception))
         self.assertTrue(document.__exit__.called)
 
+    def test_progress_callback_emits_render_before_each_page(self):
+        document = make_fake_document(3)
+        events = []
+        with mock.patch.object(ocr_service, "pymupdf") as fake_pymupdf:
+            fake_pymupdf.open.return_value = document
+            ocr_service.render_pdf(
+                self.pdf_path, 150, self.temp_dir, lambda _msg: None,
+                lambda phase, cur, tot: events.append((phase, cur, tot)),
+            )
+        self.assertEqual(
+            events,
+            [
+                ("render", 1, 3),
+                ("render", 2, 3),
+                ("render", 3, 3),
+            ],
+        )
+        # Each progress event fires before the corresponding page render.
+        self.assertEqual(len(document.fake_pages), 3)
+
 
 class TestProcessOcr(unittest.TestCase):
     URL = "http://server:11434"
@@ -490,6 +532,45 @@ class TestProcessOcr(unittest.TestCase):
             except Exception as exc:
                 error = exc
         return result, error, drain(events), created
+
+    def test_pdf_progress_events_render_then_ocr(self):
+        """A 3-page PDF emits 3 render events then 3 ocr events, in order."""
+        request = self.make_request("doc.pdf")
+        document = make_fake_document(3)
+        _result, _error, events, _created = self.run_pdf_pipeline(
+            request,
+            document,
+            [chat_response("p1"), chat_response("p2"), chat_response("p3")],
+        )
+        progress_events = [
+            payload for kind, payload in events if kind == "progress"
+        ]
+        self.assertEqual(len(progress_events), 6)
+        # First three are render phase.
+        for i in range(3):
+            self.assertEqual(progress_events[i]["phase"], "render")
+            self.assertEqual(progress_events[i]["current"], i + 1)
+            self.assertEqual(progress_events[i]["total"], 3)
+        # Last three are ocr phase.
+        for i in range(3):
+            self.assertEqual(progress_events[3 + i]["phase"], "ocr")
+            self.assertEqual(progress_events[3 + i]["current"], i + 1)
+            self.assertEqual(progress_events[3 + i]["total"], 3)
+
+    def test_image_progress_events_only_ocr(self):
+        """An image input emits exactly one ocr progress event, no render."""
+        request = self.make_request("photo.png")
+        events = queue.Queue()
+        with mock.patch.object(ocr_service.ollama, "Client") as client_cls:
+            client_cls.return_value.chat.return_value = chat_response("recognized")
+            ocr_service.process_ocr(request, events)
+        progress_events = [
+            payload for kind, payload in drain(events) if kind == "progress"
+        ]
+        self.assertEqual(len(progress_events), 1)
+        self.assertEqual(progress_events[0]["phase"], "ocr")
+        self.assertEqual(progress_events[0]["current"], 1)
+        self.assertEqual(progress_events[0]["total"], 1)
 
     def test_image_input_passed_directly_no_render_dir(self):
         request = self.make_request("photo.png")

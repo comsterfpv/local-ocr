@@ -48,6 +48,7 @@ class LocalOCRApp(ctk.CTk):
         self.closing = False
         self.selected_path: Path | None = None
         self.event_queue: queue.Queue = queue.Queue()
+        self._render_phase_seen = False
 
         self._build_layout()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -119,8 +120,15 @@ class LocalOCRApp(ctk.CTk):
         )
         self.start_button.grid(row=2, column=0, sticky="ew", padx=PADX, pady=4)
 
-        self.progress = ctk.CTkProgressBar(self, mode="indeterminate")
-        self.progress.grid(row=3, column=0, sticky="ew", padx=PADX, pady=4)
+        # Status section: progress bar + page counter label
+        self.status_frame = ctk.CTkFrame(self)
+        self.status_frame.grid(row=3, column=0, sticky="ew", padx=PADX, pady=4)
+        self.status_frame.grid_columnconfigure(0, weight=1)
+
+        self.progress = ctk.CTkProgressBar(self.status_frame, mode="indeterminate")
+        self.progress.grid(row=0, column=0, sticky="ew", padx=(PADX, 8), pady=PADY)
+        self.status_label = ctk.CTkLabel(self.status_frame, text="", width=160)
+        self.status_label.grid(row=0, column=1, padx=(0, PADX), pady=PADY)
         self.progress.set(0)
 
         self.log_box = ctk.CTkTextbox(
@@ -158,6 +166,8 @@ class LocalOCRApp(ctk.CTk):
             self.on_refresh_error(payload)
         elif kind == "ocr_success":
             self.on_ocr_success(payload)
+        elif kind == "progress":
+            self.on_progress(payload)
         elif kind == "ocr_error":
             self.on_ocr_error(payload)
         else:
@@ -187,6 +197,9 @@ class LocalOCRApp(ctk.CTk):
         self.start_button.configure(
             state="disabled", text="Processing, please wait..."
         )
+        self._render_phase_seen = False
+        self.status_label.configure(text="")
+        self.progress.configure(mode="indeterminate")
         self.progress.start()
 
     def _restore_idle(self) -> None:
@@ -197,7 +210,10 @@ class LocalOCRApp(ctk.CTk):
         self.dpi_combobox.configure(state="readonly")
         self.start_button.configure(state="normal", text="Start OCR")
         self.progress.stop()
+        self.progress.configure(mode="indeterminate")
         self.progress.set(0)
+        self.status_label.configure(text="")
+        self._render_phase_seen = False
         self.operation_state = OperationState.IDLE
 
     # ----------------------------------------------------- file selection
@@ -246,6 +262,27 @@ class LocalOCRApp(ctk.CTk):
             self.event_queue.put(("refresh_error", str(exc)))
         else:
             self.event_queue.put(("models_loaded", models))
+
+    def on_progress(self, payload: dict) -> None:
+        phase = payload["phase"]
+        current = payload["current"]
+        total = payload["total"]
+
+        if phase == "render":
+            self._render_phase_seen = True
+            fraction = 0.2 * current / total
+        else:  # "ocr"
+            if self._render_phase_seen:
+                fraction = 0.2 + 0.8 * current / total
+            else:
+                fraction = current / total
+
+        self.progress.stop()
+        self.progress.configure(mode="determinate")
+        self.progress.set(fraction)
+
+        phase_label = "OCR" if phase == "ocr" else "Render"
+        self.status_label.configure(text=f"Page {current} / {total} ({phase_label})")
 
     def on_models_loaded(self, models: list[str]) -> None:
         self._restore_idle()
