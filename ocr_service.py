@@ -6,8 +6,11 @@ headlessly and no worker can accidentally touch the GUI.
 
 from __future__ import annotations
 
+import io
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,6 +24,7 @@ import config
 
 LogCallback = Callable[[str], None]
 ProgressCallback = Callable[[str, int, int], None]  # phase, current, total
+EventCallback = Callable[[str, dict], None]  # (kind, payload)
 
 
 class OCRServiceError(Exception):
@@ -134,22 +138,63 @@ def render_pdf(
     return image_paths
 
 
+def make_thumbnail_png(image_path: Path, max_side: int) -> bytes:
+    """Return a downscaled PNG of an image file, longest side <= max_side.
+
+    Tk-free (PIL only) so it can be unit-tested headlessly. Accepts any
+    format PIL can read — the input images (PNG/JPEG/WebP) and the PNGs
+    rendered from PDF pages. Smaller images are never upscaled.
+    """
+    from PIL import Image  # local import keeps module load light and headless
+
+    with Image.open(image_path) as img:
+        thumbnail = img.convert("RGB")
+        thumbnail.thumbnail((max_side, max_side))
+        buffer = io.BytesIO()
+        thumbnail.save(buffer, format="PNG")
+        return buffer.getvalue()
+
+
 def recognize_images(
     client: "ollama.Client",
     model: str,
     image_paths: list[Path],
     log_callback: LogCallback,
     progress_callback: ProgressCallback | None = None,
+    event_callback: EventCallback | None = None,
 ) -> list[str]:
-    """Send one independent chat request per image; return texts in order."""
+    """Send one independent chat request per image; return texts in order.
+
+    Each page is requested with ``stream=True`` so that the recognized text
+    appears in the UI as the model generates it.  Every chunk delta is
+    surfaced via ``("stream_chunk", {"page": n, "text": delta})`` events;
+    after the full page text is assembled and validated a final
+    ``("page_text", {"page": n, "total": N, "text": text})`` event is
+    emitted.  The non-streaming result is identical — streaming only adds
+    the live deltas.
+    """
     total = len(image_paths)
     results: list[str] = []
     for number, image_path in enumerate(image_paths, start=1):
         if progress_callback is not None:
             progress_callback("ocr", number, total)
+        if event_callback is not None:
+            # A failed preview must never abort OCR: log it and move on.
+            try:
+                png = make_thumbnail_png(image_path, config.THUMBNAIL_MAX_SIDE)
+            except Exception as exc:
+                log_callback(
+                    f"Could not build preview for page {number}/{total}: {exc}"
+                )
+            else:
+                event_callback(
+                    "page_image",
+                    {"page": number, "total": total, "png": png},
+                )
         log_callback(f"Sending page {number}/{total} to Ollama...")
+        chunks: list[str] = []
         try:
-            response = client.chat(
+            stream = client.chat(
                 model=model,
                 messages=[
                     {"role": "system", "content": config.SYSTEM_PROMPT},
@@ -159,19 +204,35 @@ def recognize_images(
                         "images": [str(image_path)],
                     },
                 ],
+                stream=True,
             )
+            for chunk in stream:
+                delta = (getattr(getattr(chunk, "message", None), "content", None)
+                         or "")
+                if delta:
+                    chunks.append(delta)
+                    if event_callback is not None:
+                        event_callback(
+                            "stream_chunk",
+                            {"page": number, "text": delta},
+                        )
         except Exception as exc:
             raise OCRServiceError(
                 f"Ollama request failed on page {number}/{total} "
                 f"(model {model!r}): {exc}"
             ) from exc
-        content = (response.message.content or "").strip()
+        content = "".join(chunks).strip()
         if not content:
             raise OCRServiceError(
                 f"Ollama returned no text for page {number}/{total} "
                 f"(model {model!r})."
             )
         results.append(content)
+        if event_callback is not None:
+            event_callback(
+                "page_text",
+                {"page": number, "total": total, "text": content},
+            )
     return results
 
 
@@ -202,6 +263,42 @@ def save_markdown_atomic(output_path: Path, content: str) -> None:
         raise OCRServiceError(f"Could not save output file: {exc}") from exc
 
 
+def open_in_default_app(path: Path) -> None:
+    """Open a file with the OS default application. Tk-free.
+
+    macOS uses ``open``, Windows ``os.startfile``, other platforms
+    ``xdg-open``. Any failure is wrapped in OCRServiceError.
+    """
+    try:
+        if sys.platform == "darwin":
+            subprocess.run(["open", str(path)], check=True)
+        elif sys.platform.startswith("win"):
+            os.startfile(str(path))  # type: ignore[attr-defined]  # Windows only
+        else:
+            subprocess.run(["xdg-open", str(path)], check=True)
+    except Exception as exc:
+        raise OCRServiceError(f"Could not open {path}: {exc}") from exc
+
+
+def reveal_in_file_manager(path: Path) -> None:
+    """Reveal a file in the OS file manager (Finder/Explorer). Tk-free.
+
+    macOS selects the file with ``open -R``; Windows with
+    ``explorer /select,``; other platforms open the containing directory
+    (no portable "select" flag exists). Any failure is wrapped.
+    """
+    try:
+        if sys.platform == "darwin":
+            subprocess.run(["open", "-R", str(path)], check=True)
+        elif sys.platform.startswith("win"):
+            # explorer returns exit code 1 even on success, so no check=True.
+            subprocess.run(["explorer", f"/select,{path}"])
+        else:
+            subprocess.run(["xdg-open", str(path.parent)], check=True)
+    except Exception as exc:
+        raise OCRServiceError(f"Could not reveal {path}: {exc}") from exc
+
+
 def process_ocr(request: OCRRequest, event_queue) -> Path:
     """Run the full OCR pipeline; emit ('log', message) events; return output.
 
@@ -217,6 +314,9 @@ def process_ocr(request: OCRRequest, event_queue) -> Path:
 
     def progress(phase: str, current: int, total: int) -> None:
         event_queue.put(("progress", {"phase": phase, "current": current, "total": total}))
+
+    def emit_event(kind: str, payload: dict) -> None:
+        event_queue.put((kind, payload))
 
     temp_dir: Path | None = None
     try:
@@ -240,7 +340,10 @@ def process_ocr(request: OCRRequest, event_queue) -> Path:
             image_paths = [request.input_path]
 
         try:
-            client = ollama.Client(host=request.ollama_url, timeout=config.OCR_TIMEOUT)
+            client = ollama.Client(
+                host=request.ollama_url,
+                timeout=config.OCR_STREAM_IDLE_TIMEOUT,
+            )
         except Exception as exc:
             raise OCRServiceError(
                 f"Could not create Ollama client for {request.ollama_url}: {exc}"
@@ -252,6 +355,7 @@ def process_ocr(request: OCRRequest, event_queue) -> Path:
             image_paths,
             lambda message: log(f"[2/3] {message}"),
             progress,
+            emit_event,
         )
 
         log("[3/3] Saving Markdown...")

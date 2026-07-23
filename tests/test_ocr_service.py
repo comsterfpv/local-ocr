@@ -18,6 +18,15 @@ def chat_response(content):
     return SimpleNamespace(message=SimpleNamespace(content=content))
 
 
+def stream_response(*deltas):
+    """An iterator of stream chunks, the shape of chat(..., stream=True).
+
+    Each delta becomes one chunk with ``message.content``; ``None``/empty
+    deltas are kept to mimic real server output (the service skips them).
+    """
+    return iter([SimpleNamespace(message=SimpleNamespace(content=d)) for d in deltas])
+
+
 def model_entry(tag):
     """Shape of ollama.Client.list() entries: item.model."""
     return SimpleNamespace(model=tag)
@@ -219,6 +228,70 @@ class TestListModels(unittest.TestCase):
         self.assertIn(self.URL, str(ctx.exception))
 
 
+class TestOpenInDefaultApp(unittest.TestCase):
+    PATH = Path("/docs/out_extracted.md")
+
+    def test_macos_uses_open(self):
+        with mock.patch.object(ocr_service.sys, "platform", "darwin"), \
+                mock.patch.object(ocr_service.subprocess, "run") as run:
+            ocr_service.open_in_default_app(self.PATH)
+        run.assert_called_once_with(["open", str(self.PATH)], check=True)
+
+    def test_linux_uses_xdg_open(self):
+        with mock.patch.object(ocr_service.sys, "platform", "linux"), \
+                mock.patch.object(ocr_service.subprocess, "run") as run:
+            ocr_service.open_in_default_app(self.PATH)
+        run.assert_called_once_with(["xdg-open", str(self.PATH)], check=True)
+
+    def test_windows_uses_startfile(self):
+        with mock.patch.object(ocr_service.sys, "platform", "win32"), \
+                mock.patch.object(ocr_service.os, "startfile", create=True) as startfile:
+            ocr_service.open_in_default_app(self.PATH)
+        startfile.assert_called_once_with(str(self.PATH))
+
+    def test_failure_wrapped(self):
+        with mock.patch.object(ocr_service.sys, "platform", "darwin"), \
+                mock.patch.object(
+                    ocr_service.subprocess, "run",
+                    side_effect=OSError("no such tool"),
+                ):
+            with self.assertRaises(OCRServiceError) as ctx:
+                ocr_service.open_in_default_app(self.PATH)
+        self.assertIn(str(self.PATH), str(ctx.exception))
+
+
+class TestRevealInFileManager(unittest.TestCase):
+    PATH = Path("/docs/out_extracted.md")
+
+    def test_macos_selects_with_open_r(self):
+        with mock.patch.object(ocr_service.sys, "platform", "darwin"), \
+                mock.patch.object(ocr_service.subprocess, "run") as run:
+            ocr_service.reveal_in_file_manager(self.PATH)
+        run.assert_called_once_with(["open", "-R", str(self.PATH)], check=True)
+
+    def test_windows_selects_with_explorer(self):
+        with mock.patch.object(ocr_service.sys, "platform", "win32"), \
+                mock.patch.object(ocr_service.subprocess, "run") as run:
+            ocr_service.reveal_in_file_manager(self.PATH)
+        run.assert_called_once_with(["explorer", f"/select,{self.PATH}"])
+
+    def test_linux_opens_parent_directory(self):
+        with mock.patch.object(ocr_service.sys, "platform", "linux"), \
+                mock.patch.object(ocr_service.subprocess, "run") as run:
+            ocr_service.reveal_in_file_manager(self.PATH)
+        run.assert_called_once_with(["xdg-open", str(self.PATH.parent)], check=True)
+
+    def test_failure_wrapped(self):
+        with mock.patch.object(ocr_service.sys, "platform", "darwin"), \
+                mock.patch.object(
+                    ocr_service.subprocess, "run",
+                    side_effect=OSError("boom"),
+                ):
+            with self.assertRaises(OCRServiceError) as ctx:
+                ocr_service.reveal_in_file_manager(self.PATH)
+        self.assertIn(str(self.PATH), str(ctx.exception))
+
+
 class TestSaveMarkdownAtomic(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -269,7 +342,7 @@ class TestRecognizeImages(unittest.TestCase):
 
     def test_one_independent_request_per_image_with_exact_prompt(self):
         client = mock.MagicMock()
-        client.chat.side_effect = [chat_response(" one "), chat_response("two\n")]
+        client.chat.side_effect = [stream_response(" one "), stream_response("two\n")]
         paths = [Path("/imgs/page_0001.png"), Path("/imgs/page_0002.png")]
         results = ocr_service.recognize_images(
             client, self.MODEL, paths, lambda _msg: None
@@ -277,6 +350,7 @@ class TestRecognizeImages(unittest.TestCase):
         self.assertEqual(results, ["one", "two"])
         self.assertEqual(client.chat.call_count, 2)
         for call, path in zip(client.chat.call_args_list, paths):
+            self.assertTrue(call.kwargs["stream"])
             self.assertEqual(call.kwargs["model"], self.MODEL)
             self.assertEqual(
                 call.kwargs["messages"],
@@ -294,7 +368,7 @@ class TestRecognizeImages(unittest.TestCase):
 
     def test_progress_messages_in_order(self):
         client = mock.MagicMock()
-        client.chat.side_effect = [chat_response(f"p{i}") for i in range(3)]
+        client.chat.side_effect = [stream_response(f"p{i}") for i in range(3)]
         logs = []
         ocr_service.recognize_images(
             client, self.MODEL, [Path(f"/i/{i}.png") for i in range(3)], logs.append
@@ -310,7 +384,7 @@ class TestRecognizeImages(unittest.TestCase):
 
     def test_progress_callback_emits_ocr_before_each_page(self):
         client = mock.MagicMock()
-        client.chat.side_effect = [chat_response(f"p{i}") for i in range(3)]
+        client.chat.side_effect = [stream_response(f"p{i}") for i in range(3)]
         events = []
         ocr_service.recognize_images(
             client,
@@ -334,7 +408,10 @@ class TestRecognizeImages(unittest.TestCase):
         for empty in (None, "", "   \n\t"):
             with self.subTest(content=repr(empty)):
                 client = mock.MagicMock()
-                client.chat.side_effect = [chat_response("fine"), chat_response(empty)]
+                client.chat.side_effect = [
+                    stream_response("fine"),
+                    stream_response(empty),
+                ]
                 with self.assertRaises(OCRServiceError) as ctx:
                     ocr_service.recognize_images(
                         client,
@@ -344,9 +421,25 @@ class TestRecognizeImages(unittest.TestCase):
                     )
                 self.assertIn("page 2/2", str(ctx.exception))
 
+    def test_empty_stream_fails_identifying_page(self):
+        """A stream that yields zero chunks triggers 'returned no text'."""
+        client = mock.MagicMock()
+        client.chat.side_effect = [stream_response("fine"), stream_response()]
+        with self.assertRaises(OCRServiceError) as ctx:
+            ocr_service.recognize_images(
+                client,
+                self.MODEL,
+                [Path("/i/1.png"), Path("/i/2.png")],
+                lambda _msg: None,
+            )
+        self.assertIn("page 2/2", str(ctx.exception))
+
     def test_chat_failure_wrapped_with_page_and_model_context(self):
         client = mock.MagicMock()
-        client.chat.side_effect = [chat_response("ok"), RuntimeError("model not found")]
+        client.chat.side_effect = [
+            stream_response("ok"),
+            RuntimeError("model not found"),
+        ]
         with self.assertRaises(OCRServiceError) as ctx:
             ocr_service.recognize_images(
                 client,
@@ -358,6 +451,177 @@ class TestRecognizeImages(unittest.TestCase):
         self.assertIn("page 2/2", message)
         self.assertIn(self.MODEL, message)
         self.assertIn("model not found", message)
+
+    def test_generator_exception_mid_stream_wrapped_with_context(self):
+        """An exception raised while iterating the stream is wrapped."""
+
+        def exploding_stream():
+            yield SimpleNamespace(message=SimpleNamespace(content="part"))
+            raise RuntimeError("connection dropped")
+
+        client = mock.MagicMock()
+        client.chat.side_effect = [stream_response("ok"), exploding_stream()]
+        with self.assertRaises(OCRServiceError) as ctx:
+            ocr_service.recognize_images(
+                client,
+                self.MODEL,
+                [Path("/i/1.png"), Path("/i/2.png")],
+                lambda _msg: None,
+            )
+        message = str(ctx.exception)
+        self.assertIn("page 2/2", message)
+        self.assertIn("connection dropped", message)
+
+    def test_stream_chunk_events_emitted_in_order(self):
+        """stream_chunk events carry each delta, in order, with page number."""
+        client = mock.MagicMock()
+        client.chat.side_effect = [
+            stream_response("Hel", "lo", " world"),
+            stream_response("foo"),
+        ]
+        events = []
+        ocr_service.recognize_images(
+            client,
+            self.MODEL,
+            [Path("/i/1.png"), Path("/i/2.png")],
+            lambda _msg: None,
+            event_callback=lambda kind, payload: events.append((kind, payload)),
+        )
+        stream_events = [(k, p) for k, p in events if k == "stream_chunk"]
+        self.assertEqual(
+            stream_events,
+            [
+                ("stream_chunk", {"page": 1, "text": "Hel"}),
+                ("stream_chunk", {"page": 1, "text": "lo"}),
+                ("stream_chunk", {"page": 1, "text": " world"}),
+                ("stream_chunk", {"page": 2, "text": "foo"}),
+            ],
+        )
+
+    def test_page_text_events_emitted_after_each_page(self):
+        """page_text events carry the assembled (stripped) text per page."""
+        client = mock.MagicMock()
+        client.chat.side_effect = [
+            stream_response("  Hello ", "world  "),
+            stream_response("second"),
+        ]
+        events = []
+        results = ocr_service.recognize_images(
+            client,
+            self.MODEL,
+            [Path("/i/1.png"), Path("/i/2.png")],
+            lambda _msg: None,
+            event_callback=lambda kind, payload: events.append((kind, payload)),
+        )
+        page_events = [(k, p) for k, p in events if k == "page_text"]
+        self.assertEqual(
+            page_events,
+            [
+                ("page_text", {"page": 1, "total": 2, "text": "Hello world"}),
+                ("page_text", {"page": 2, "total": 2, "text": "second"}),
+            ],
+        )
+        # The returned texts match the page_text payloads (stripped).
+        self.assertEqual(results, ["Hello world", "second"])
+
+    def test_page_image_event_before_send_with_valid_png(self):
+        """A page_image event with valid PNG bytes precedes the send log."""
+        import io as _io
+
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as d:
+            img_path = Path(d) / "page.png"
+            Image.new("RGB", (400, 300), (10, 20, 30)).save(img_path)
+            client = mock.MagicMock()
+            client.chat.side_effect = [stream_response("text")]
+            timeline = []
+            ocr_service.recognize_images(
+                client,
+                self.MODEL,
+                [img_path],
+                lambda msg: timeline.append(("log", msg)),
+                event_callback=lambda kind, payload: timeline.append((kind, payload)),
+            )
+        kinds = [entry[0] for entry in timeline]
+        self.assertIn("page_image", kinds)
+        image_index = kinds.index("page_image")
+        send_index = next(
+            i for i, entry in enumerate(timeline)
+            if entry[0] == "log" and "Sending page" in entry[1]
+        )
+        self.assertLess(image_index, send_index)
+        payload = timeline[image_index][1]
+        self.assertEqual(payload["page"], 1)
+        self.assertEqual(payload["total"], 1)
+        Image.open(_io.BytesIO(payload["png"])).verify()
+
+    def test_thumbnail_failure_does_not_abort_ocr(self):
+        """A missing image file skips the preview but still recognizes."""
+        client = mock.MagicMock()
+        client.chat.side_effect = [stream_response("recognized")]
+        events = []
+        results = ocr_service.recognize_images(
+            client,
+            self.MODEL,
+            [Path("/does/not/exist.png")],
+            lambda _msg: None,
+            event_callback=lambda kind, payload: events.append((kind, payload)),
+        )
+        self.assertEqual(results, ["recognized"])
+        self.assertNotIn("page_image", [kind for kind, _ in events])
+
+
+class TestMakeThumbnailPng(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+
+    def _write_image(self, name, size, color=(120, 60, 200)):
+        from PIL import Image
+
+        path = self.dir / name
+        Image.new("RGB", size, color).save(path)
+        return path
+
+    def _open(self, data):
+        import io as _io
+
+        from PIL import Image
+
+        return Image.open(_io.BytesIO(data))
+
+    def test_downscales_png_preserving_aspect_and_returns_png(self):
+        path = self._write_image("big.png", (2000, 1000))
+        data = ocr_service.make_thumbnail_png(path, 900)
+        self.assertIsInstance(data, bytes)
+        out = self._open(data)
+        self.assertEqual(out.format, "PNG")
+        self.assertEqual(out.size, (900, 450))  # 2:1 aspect preserved
+
+    def test_jpeg_input_supported(self):
+        path = self._write_image("photo.jpg", (1200, 800))
+        out = self._open(ocr_service.make_thumbnail_png(path, 600))
+        self.assertEqual(out.format, "PNG")
+        self.assertLessEqual(max(out.size), 600)
+
+    def test_small_image_not_upscaled(self):
+        path = self._write_image("small.png", (100, 50))
+        out = self._open(ocr_service.make_thumbnail_png(path, 900))
+        self.assertEqual(out.size, (100, 50))
+
+    def test_real_pdf_rendered_page(self):
+        """The pipeline feeds PNGs rendered from PDF pages — thumbnail one."""
+        document = ocr_service.pymupdf.open()
+        document.new_page(width=1200, height=1600)
+        pixmap = document.load_page(0).get_pixmap(dpi=150)
+        path = self.dir / "page_0001.png"
+        pixmap.save(str(path))
+        document.close()
+        out = self._open(ocr_service.make_thumbnail_png(path, 900))
+        self.assertEqual(out.format, "PNG")
+        self.assertLessEqual(max(out.size), 900)
 
 
 class TestRenderPdf(unittest.TestCase):
@@ -540,7 +804,7 @@ class TestProcessOcr(unittest.TestCase):
         _result, _error, events, _created = self.run_pdf_pipeline(
             request,
             document,
-            [chat_response("p1"), chat_response("p2"), chat_response("p3")],
+            [stream_response("p1"), stream_response("p2"), stream_response("p3")],
         )
         progress_events = [
             payload for kind, payload in events if kind == "progress"
@@ -562,7 +826,7 @@ class TestProcessOcr(unittest.TestCase):
         request = self.make_request("photo.png")
         events = queue.Queue()
         with mock.patch.object(ocr_service.ollama, "Client") as client_cls:
-            client_cls.return_value.chat.return_value = chat_response("recognized")
+            client_cls.return_value.chat.return_value = stream_response("recognized")
             ocr_service.process_ocr(request, events)
         progress_events = [
             payload for kind, payload in drain(events) if kind == "progress"
@@ -577,14 +841,17 @@ class TestProcessOcr(unittest.TestCase):
         events = queue.Queue()
         with mock.patch.object(ocr_service.ollama, "Client") as client_cls, \
                 mock.patch.object(ocr_service.tempfile, "mkdtemp") as mkdtemp:
-            client_cls.return_value.chat.return_value = chat_response("recognized")
+            client_cls.return_value.chat.return_value = stream_response("recognized")
             result = ocr_service.process_ocr(request, events)
         mkdtemp.assert_not_called()
         self.assertEqual(result, request.output_path)
         self.assertEqual(
             request.output_path.read_text(encoding="utf-8"), "recognized"
         )
-        client_cls.assert_called_once_with(host=self.URL, timeout=config.OCR_TIMEOUT)
+        client_cls.assert_called_once_with(
+            host=self.URL, timeout=config.OCR_STREAM_IDLE_TIMEOUT
+        )
+        self.assertTrue(client_cls.return_value.chat.call_args.kwargs["stream"])
         images = client_cls.return_value.chat.call_args.kwargs["messages"][1]["images"]
         self.assertEqual(images, [str(request.input_path)])
         logs = [payload for kind, payload in drain(events) if kind == "log"]
@@ -598,7 +865,7 @@ class TestProcessOcr(unittest.TestCase):
         result, error, events, created = self.run_pdf_pipeline(
             request,
             document,
-            [chat_response("p1"), chat_response("p2"), chat_response("p3")],
+            [stream_response("p1"), stream_response("p2"), stream_response("p3")],
         )
         self.assertIsNone(error)
         self.assertEqual(result, request.output_path)
@@ -677,7 +944,7 @@ class TestProcessOcr(unittest.TestCase):
         result, error, _events, created = self.run_pdf_pipeline(
             request,
             document,
-            [chat_response("p1"), RuntimeError("model exploded")],
+            [stream_response("p1"), RuntimeError("model exploded")],
         )
         self.assertIsNone(result)
         self.assertIsInstance(error, OCRServiceError)
@@ -691,7 +958,7 @@ class TestProcessOcr(unittest.TestCase):
         result, error, _events, created = self.run_pdf_pipeline(
             request,
             document,
-            [chat_response("p1"), RuntimeError("model exploded")],
+            [stream_response("p1"), RuntimeError("model exploded")],
         )
         self.assertIsNone(result)
         self.assertIsNotNone(error)
@@ -707,7 +974,7 @@ class TestProcessOcr(unittest.TestCase):
         result, error, _events, created = self.run_pdf_pipeline(
             request,
             document,
-            [chat_response("p1")],
+            [stream_response("p1")],
             replace_error=OSError("disk full"),
         )
         self.assertIsNone(result)
@@ -719,6 +986,83 @@ class TestProcessOcr(unittest.TestCase):
         # No stray temp output file remains next to the output either.
         leftovers = [p for p in self.dir.iterdir() if p.suffix == ".tmp"]
         self.assertEqual(leftovers, [])
+
+
+    def test_page_text_events_through_pipeline(self):
+        """process_ocr emits page_text events with assembled text per page."""
+        request = self.make_request("doc.pdf")
+        document = make_fake_document(2)
+        _result, _error, events, _created = self.run_pdf_pipeline(
+            request,
+            document,
+            [stream_response("  page one ", "text"), stream_response("two")],
+        )
+        page_events = [
+            (kind, payload) for kind, payload in events if kind == "page_text"
+        ]
+        self.assertEqual(
+            page_events,
+            [
+                ("page_text", {"page": 1, "total": 2, "text": "page one text"}),
+                ("page_text", {"page": 2, "total": 2, "text": "two"}),
+            ],
+        )
+
+    def test_stream_chunk_events_through_pipeline(self):
+        """process_ocr emits stream_chunk events for each delta."""
+        request = self.make_request("photo.png")
+        events = queue.Queue()
+        with mock.patch.object(ocr_service.ollama, "Client") as client_cls:
+            client_cls.return_value.chat.return_value = stream_response("A", "B", "C")
+            ocr_service.process_ocr(request, events)
+        chunk_events = [
+            (kind, payload) for kind, payload in drain(events) if kind == "stream_chunk"
+        ]
+        self.assertEqual(
+            chunk_events,
+            [
+                ("stream_chunk", {"page": 1, "text": "A"}),
+                ("stream_chunk", {"page": 1, "text": "B"}),
+                ("stream_chunk", {"page": 1, "text": "C"}),
+            ],
+        )
+
+    def test_mid_stream_generator_exception_cleans_temp_dir(self):
+        """An exception while iterating a stream cleans the temp dir."""
+
+        def exploding_stream():
+            yield SimpleNamespace(message=SimpleNamespace(content="partial"))
+            raise RuntimeError("connection dropped")
+
+        request = self.make_request("doc.pdf")
+        document = make_fake_document(2)
+        result, error, _events, created = self.run_pdf_pipeline(
+            request,
+            document,
+            [exploding_stream(), stream_response("p2")],
+        )
+        self.assertIsNone(result)
+        self.assertIsInstance(error, OCRServiceError)
+        self.assertIn("page 1/2", str(error))
+        self.assertIn("connection dropped", str(error))
+        self.assertFalse(Path(created[0]).exists())
+        self.assertFalse(request.output_path.exists())
+
+    def test_empty_stream_through_pipeline_fails(self):
+        """A stream with zero chunks triggers 'returned no text'."""
+        request = self.make_request("photo.png")
+        events = queue.Queue()
+        with mock.patch.object(ocr_service.ollama, "Client") as client_cls:
+            client_cls.return_value.chat.return_value = stream_response()
+            error = None
+            try:
+                ocr_service.process_ocr(request, events)
+            except Exception as exc:
+                error = exc
+        self.assertIsInstance(error, OCRServiceError)
+        self.assertIn("returned no text", str(error))
+        self.assertIn("page 1/1", str(error))
+        self.assertFalse(request.output_path.exists())
 
 
 if __name__ == "__main__":

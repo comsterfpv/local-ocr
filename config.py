@@ -13,9 +13,22 @@ PDF_EXTENSIONS = frozenset({".pdf"})
 IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".webp"})
 SUPPORTED_EXTENSIONS = PDF_EXTENSIONS | IMAGE_EXTENSIONS
 
-# Seconds. Model listing should fail fast; OCR of a large page can be slow.
+# Seconds. Model listing should fail fast.
 MODEL_LIST_TIMEOUT = 10
-OCR_TIMEOUT = 600
+# Seconds of "silence" between stream chunks before a page request is
+# considered stuck. OCR runs with stream=True, so the httpx timeout applies
+# to the pauses between chunks rather than to the whole response — better
+# than a single overall timeout (a long page won't hit it).
+OCR_STREAM_IDLE_TIMEOUT = 120
+
+# Milliseconds — throttling of live stream UI updates so Tk doesn't choke
+# on a flood of tiny inserts.
+STREAM_UI_FLUSH_MS = 100
+
+# Pixels — longest side of the page preview thumbnail. Large enough to stay
+# crisp if a bigger side-by-side view reuses the same bytes later; the live
+# preview just displays it scaled down.
+THUMBNAIL_MAX_SIDE = 900
 
 # Milliseconds between main-thread drains of the worker event queue.
 UI_POLL_INTERVAL_MS = 50
