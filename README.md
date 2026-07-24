@@ -65,8 +65,23 @@ protect it with your firewall; Ollama has no built-in authentication.
    `.webp`).
 2. Confirm the server URL, pick or type a model tag, and choose a PDF DPI
    (100/150/200/300; higher is sharper but slower — DPI only affects PDFs).
-3. `Start OCR`. Progress appears in the log; each PDF page is rendered and
-   sent to the model in order.
+3. `Start OCR`. Each PDF page is rendered and sent to the model in order.
+
+While a job runs you can follow it in several places:
+
+- A **progress bar** with a page counter (`Page 3 / 12`) shows real progress —
+  a short render phase followed by recognition.
+- A **preview panel** displays a thumbnail of the page currently being read.
+- The **Result** tab fills with the recognized Markdown live, token by token,
+  as the model streams it. A `Copy` button copies the full text to the
+  clipboard.
+- The **Log** tab keeps the status messages.
+- The **Review** tab pairs each finished page's image with its text
+  side by side, with `◀` / `▶` navigation for spot-checking quality.
+
+On success the app switches to the Result tab and shows a dialog with `Open`
+(open the `.md` in your default app), `Show in Finder` (or `Open Folder` off
+macOS), and `OK`. On error it switches to the Log tab.
 
 ### Output
 
